@@ -632,6 +632,30 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	// 验证和规范化 API Key 认证配置
+	// 如果 auth-timeout 未设置或为负数，使用默认值 10 毫秒
+	if cfg.AuthTimeout <= 0 {
+		cfg.AuthTimeout = 10
+	}
+
+	// 验证 API Keys 配置
+	if len(cfg.APIKeys) > 0 {
+		// 去除空的 API Key
+		validKeys := make([]string, 0, len(cfg.APIKeys))
+		for _, key := range cfg.APIKeys {
+			trimmedKey := strings.TrimSpace(key)
+			if trimmedKey != "" {
+				validKeys = append(validKeys, trimmedKey)
+			}
+		}
+		cfg.APIKeys = validKeys
+
+		// 如果配置了 API Keys，记录日志
+		if len(cfg.APIKeys) > 0 {
+			log.Infof("API Key authentication enabled with %d key(s), timeout: %dms", len(cfg.APIKeys), cfg.AuthTimeout)
+		}
+	}
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 

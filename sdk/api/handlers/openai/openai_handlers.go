@@ -17,8 +17,10 @@ import (
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	responsesconverter "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/openai/openai/responses"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -463,6 +465,10 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 	}
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
+	
+	// 提取 messages 用于 token 估算
+	messages := extractMessages(rawJSON)
+	
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
@@ -512,7 +518,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			flusher.Flush()
 
 			// Continue streaming the rest
-			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, modelName, messages)
 			return
 		}
 	}
@@ -571,6 +577,10 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 	chatCompletionsJSON := convertCompletionsRequestToChatCompletions(rawJSON)
 
 	modelName := gjson.GetBytes(chatCompletionsJSON, "model").String()
+	
+	// 提取 messages 用于 token 估算
+	messages := extractMessages(chatCompletionsJSON)
+	
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
 
@@ -649,17 +659,34 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 				}
 			}()
 
-			h.handleStreamResult(c, flusher, func(err error) {
+			h.handleStreamResultWithConversion(c, flusher, func(err error) {
 				stop()
 				cliCancel(err)
-			}, convertedChan, errChan)
+			}, convertedChan, errChan, modelName, messages, true)
 			return
 		}
 	}
 }
-func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+// handleStreamResult 处理流式响应结果，包括 usage 字段的累积和发送
+//
+// 参数:
+//   - c: Gin 上下文
+//   - flusher: HTTP Flusher 接口
+//   - cancel: 取消函数
+//   - data: 数据通道
+//   - errs: 错误通道
+//   - modelName: 模型名称
+//   - messages: 请求消息列表
+func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, modelName string, messages []usage.Message) {
+	// 创建 usage 累积器
+	accumulator := usage.NewStreamUsageAccumulator(modelName, messages)
+
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
+			// 累积内容用于 token 估算
+			accumulator.AccumulateChunk(chunk)
+			
+			// 转发数据块
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
@@ -678,7 +705,121 @@ func (h *OpenAIAPIHandler) handleStreamResult(c *gin.Context, flusher http.Flush
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
 		},
 		WriteDone: func() {
+			// 在 [DONE] 之前发送 usage 数据块
+			usageChunk, err := accumulator.GenerateUsageChunk()
+			if err != nil {
+				// 如果生成 usage 失败，记录错误但不中断流式响应
+				log.Errorf("Failed to generate usage chunk: %v", err)
+			} else {
+				// 发送包含 usage 的数据块
+				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(usageChunk))
+			}
+			
+			// 发送 [DONE] 标记
 			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 		},
 	})
+}
+
+// handleStreamResultWithConversion 处理需要格式转换的流式响应结果（如 completions 端点）
+//
+// 参数:
+//   - c: Gin 上下文
+//   - flusher: HTTP Flusher 接口
+//   - cancel: 取消函数
+//   - data: 数据通道
+//   - errs: 错误通道
+//   - modelName: 模型名称
+//   - messages: 请求消息列表
+//   - isCompletions: 是否为 completions 格式
+func (h *OpenAIAPIHandler) handleStreamResultWithConversion(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, modelName string, messages []usage.Message, isCompletions bool) {
+	// 创建 usage 累积器
+	accumulator := usage.NewStreamUsageAccumulator(modelName, messages)
+
+	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		WriteChunk: func(chunk []byte) {
+			// 对于 completions 格式，需要从转换后的数据中提取内容
+			// 累积原始内容用于 token 估算
+			if isCompletions {
+				// 从 completions 格式的 chunk 中提取 text 字段
+				text := gjson.GetBytes(chunk, "choices.0.text").String()
+				if text != "" {
+					// 构造临时的 chat completions 格式用于累积
+					tempChunk := []byte(fmt.Sprintf(`{"choices":[{"delta":{"content":"%s"}}]}`, text))
+					accumulator.AccumulateChunk(tempChunk)
+				}
+			} else {
+				accumulator.AccumulateChunk(chunk)
+			}
+			
+			// 转发数据块
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
+		},
+		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			if errMsg == nil {
+				return
+			}
+			status := http.StatusInternalServerError
+			if errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			errText := http.StatusText(status)
+			if errMsg.Error != nil && errMsg.Error.Error() != "" {
+				errText = errMsg.Error.Error()
+			}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(body))
+		},
+		WriteDone: func() {
+			// 在 [DONE] 之前发送 usage 数据块
+			usageChunk, err := accumulator.GenerateUsageChunk()
+			if err != nil {
+				log.Errorf("Failed to generate usage chunk: %v", err)
+			} else {
+				// 如果是 completions 格式，需要转换 usage 数据块
+				if isCompletions {
+					usageChunk = convertChatCompletionsStreamChunkToCompletions(usageChunk)
+				}
+				if usageChunk != nil {
+					_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(usageChunk))
+				}
+			}
+			
+			// 发送 [DONE] 标记
+			_, _ = fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+		},
+	})
+}
+
+// extractMessages 从请求 JSON 中提取 messages 列表
+//
+// 参数:
+//   - rawJSON: 原始请求 JSON 字节数组
+//
+// 返回值:
+//   - []usage.Message: 提取的消息列表
+func extractMessages(rawJSON []byte) []usage.Message {
+	var messages []usage.Message
+	
+	// 解析 messages 数组
+	messagesResult := gjson.GetBytes(rawJSON, "messages")
+	if !messagesResult.Exists() || !messagesResult.IsArray() {
+		return messages
+	}
+	
+	// 遍历每条消息
+	messagesResult.ForEach(func(_, msg gjson.Result) bool {
+		role := msg.Get("role").String()
+		content := msg.Get("content").String()
+		
+		if role != "" && content != "" {
+			messages = append(messages, usage.Message{
+				Role:    role,
+				Content: content,
+			})
+		}
+		return true
+	})
+	
+	return messages
 }

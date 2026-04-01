@@ -324,8 +324,14 @@ func (s *Server) setupRoutes() {
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
 
+	// 获取 API Key 认证配置
+	apiKeyConfig := s.cfg.GetAPIKeyConfig()
+
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
+	// API Key 认证中间件（用于 new-api 集成）
+	v1.Use(middleware.APIKeyAuthMiddleware(apiKeyConfig))
+	// 原有的认证中间件（向后兼容）
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
@@ -340,6 +346,9 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
+	// API Key 认证中间件（用于 new-api 集成）
+	v1beta.Use(middleware.APIKeyAuthMiddleware(apiKeyConfig))
+	// 原有的认证中间件（向后兼容）
 	v1beta.Use(AuthMiddleware(s.accessManager))
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
